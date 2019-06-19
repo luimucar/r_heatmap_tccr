@@ -1,0 +1,418 @@
+---
+title: "tccR"
+output: html_notebook
+---
+
+ 
+
+```{r,warning=FALSE,message=FALSE}
+
+library(tidyverse)
+library(plyr)
+library(gridExtra) #for the grid.arrange
+library(grid) #for the title in grid.arrange
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+```{r}
+tccr = read.csv2("042519__2.csv", header = TRUE,stringsAsFactors = FALSE, sep=",", dec=".")
+#remove the first column
+m=colnames(tccr)[1] 
+tccr[,m] <-NULL
+#Transform all variables into log
+tccr[,4:14] <- log10(tccr[,4:14])
+#Add an ID to know which row to remove when removing outliers
+tccr$ID = seq(1,dim(tccr)[1],by=1)
+tccr
+```
+
+
+
+```{r}
+# This function takes the dataframe for a measure (3 values) and a variable(for instance M) and:
+# Identifies among the 3 measures one outlier.
+# The criterium for classifying a measure as an outlier is making a candidate list:the maximum and minimum.
+# for those two candidates values, to recalculate the standard deviation without that candidate
+# If the sd suffers a greater decrease in a factor, that is, if original sd / new sd > factor
+# Then the point is classified as an outlier and it will be treated afterwards (outside the function, replacing it with NA)
+outlierPoint <- function(x,variable){
+
+# factor is the sensibility for classifying outliers.
+# in the data available, the results are the following:
+# out of 396 measures of 3 values (with no log10 transformation):
+# with factor =5, 119 outliers were found, that is 119/396 = 30%
+# with factor =10, 69 outliers were found, that is 69/396 = 17%
+# with factor =50, 19 outliers were found, that is 19/396 = 5%
+# with factor =100, 12 outliers were found,  that is 12/396 = 3%
+# with factor =150, 9 outliers were found, that is 9/396 = 2%
+  
+# ADJUST HERE THE FACTOR:
+factor=5
+
+debug<-F
+#f<-by(tccr[,4],tccr[,1:3],outlierPoint)
+
+
+(mini<-min(x[,variable]))
+(maxi<-max(x[,variable]))
+  
+if(debug) message("original mean = ",mean(x[,variable]))
+if(debug) message("original sd = ",sd(x[,variable]))
+
+originalsd<-sd(x[,variable])
+
+(maxi_i <-which(x[,variable]==maxi))
+(mini_i <-which(x[,variable]==mini))
+(below_maxi_i<-which(x[,variable]<maxi))
+(above_mini_i<-which(x[,variable]>mini))
+  
+if(debug) message("index of max = ",maxi_i)
+if(debug) message("index of min = ",mini_i)
+
+(removed_max <- x[-maxi_i,])
+(removed_min <- x[-mini_i,])
+
+(new_reduced_mean <- mean(removed_max[,variable]))
+(new_increased_mean <- mean(removed_min[,variable]))
+
+
+if(debug) message("mini=",mini, "increased mean=",new_increased_mean)
+if(debug) message("maxi=",maxi, "reduced mean=",new_reduced_mean)
+min_sd<- sd(removed_min[,variable])
+if(debug) message("sd increased mean:",sd(removed_min[,variable])," -:",originalsd/min_sd)
+max_sd<-sd(removed_max[,variable])
+if(debug) message("sd reduced mean:",sd(removed_max[,variable])," -:",originalsd/max_sd)   
+if(is.na(min_sd)){return(-1)}
+if(is.na(max_sd)){return(-1)}
+
+
+#Do we have an decrease of sd by a factor, (which is good)? then the point is an outlier
+if(originalsd/min_sd >factor){
+  return(x[mini_i,]$ID)
+  
+}
+#Do we have an decrease of sd by a factor, (which is good)? then the point is an outlier
+if(originalsd/max_sd >factor){
+  return(x[maxi_i,]$ID)
+  
+}
+return(-1)
+
+}
+
+#t <- tccr[tccr$Treatment=='IFNB+/IAV+' & tccr$Cell.Type=='IFNAR1-/-' & tccr$Timepoint==24,]
+#outlierPoint(t,'M')
+
+```
+
+```{r}
+treat <- unique(tccr$Treatment)
+cell <- unique(tccr$Cell.Type)
+time <- unique(tccr$Timepoint)
+(rows <- colnames(tccr)[4:14])
+total=0
+#not able to apply by method with the function outlierPoint, therefore slow brute force with for....
+message("The following are the outliers detected (variable -> row number)")
+for(a in rows){
+  for(i in treat){
+    for(j in cell){
+      for(k in time){
+        #message(a," - ",i," - ",j," - ", k)
+        t <- tccr[tccr$Treatment==i & tccr$Cell.Type==j & tccr$Timepoint==k,]
+        res<-outlierPoint(t,a)
+        if(res>-1){ 
+          total=total+1
+          #An outlier was found, remove it.
+          tccr[res,a]=NA
+          message(a," -> ",res)
+        }
+      }
+    }
+  }
+}
+total
+```
+
+```{r}
+tccr
+#saveRDS(tccr, "tccR_removed_outliers.rds")
+```
+
+
+
+
+```{r,warning=FALSE,message=FALSE}
+#+++++++++++++++++++++++++
+# Function to calculate the mean and the standard deviation and also (mean +sd and  
+# mean-sd) for each group
+#+++++++++++++++++++++++++
+# data : a data frame
+# varname : the name of a column containing the variable
+  #to be summariezed
+# groupnames : vector of column names to be used as
+  # grouping variables
+
+#sem = sd/sqrt(n)
+#cimin = mean - 2*sem
+#cimax = mean + 2*sem
+
+
+data_summary <- function(data, varname, groupnames){
+  
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE),
+      max = mean(x[[col]], na.rm=TRUE)+sd(x[[col]], na.rm=TRUE),
+      min = mean(x[[col]], na.rm=TRUE)-sd(x[[col]], na.rm=TRUE),
+      cimin = mean(x[[col]], na.rm=TRUE)-2*sd(x[[col]], na.rm=TRUE)/sqrt(length(x[[col]])),
+      cimax = mean(x[[col]], na.rm=TRUE)+2*sd(x[[col]], na.rm=TRUE)/sqrt(length(x[[col]]))
+      )
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+```
+
+```{r}
+create_df <- function(value){
+  df_ <- data_summary(tccr, varname=value, groupnames=c("Cell.Type","Timepoint","Treatment"))
+  df_[order(df_$Cell.Type,df_$Timepoint,df_$Treatment),]
+  time <- c(seq(9,14,by=1),seq(21,26,by=1))
+  df_$Timepoint2 = c(time,time,time)
+  #reorder factors please to adquate to the plot requirements
+  df_$Cell.Type=factor(df_$Cell.Type, levels=c("Wildtype", "IFNAR1-/-", "IFNLR1-/-"))
+  return(df_)
+}
+
+dfM<-create_df('M')
+dfIFNA<-create_df('IFNA')
+dfIFNb<-create_df('IFNb')
+dfIL29<-create_df('IL29')
+dfIl28a<-create_df('Il28a')
+dfMXA<-create_df('MXA')
+dfRIGI<-create_df('RIGI')
+dfISG15 <- create_df('ISG15')
+dfIFIT2 <- create_df('IFIT2')
+dfIFITM1 <- create_df('IFITM1')
+dfRantes <- create_df('Rantes')
+dfM
+```
+
+```{r}
+list1 <- c('IFN-/IAV-','IFN-/IAV+')
+list2 <- c('IFNB+/IAV+','IFN-/IAV+','IFNL+/IAV+')
+list3 <- c('IFN-/IAV-','IFNB+/IAV-','IFNL+/IAV-')
+```
+
+
+```{r}
+
+g_all <- function(type,l){
+
+esi = 0.8
+tsi = 15
+asi = 1.3
+ewidth=.4
+title_size=40
+df<- get(paste("df",type,sep=""))
+ treatment <- unique(df$Treatment)
+
+
+q<-df[df$Treatment %in% l,]  %>%
+  ggplot(aes_string(x="Cell.Type",y=type,ymin="cimin", ymax="cimax",fill = "Treatment")) +
+  geom_bar(stat='identity', position = "dodge") +
+  geom_errorbar(width=0.4,position=position_dodge(0.9), size=0.8)+
+  scale_fill_manual(values=c("IFN-/IAV-"="black", "IFN-/IAV+"="gray","IFNB+/IAV-"="red","IFNB+/IAV+"="Orange", "IFNL+/IAV-"="Blue", "IFNL+/IAV+"="Purple"), breaks=treatment)+
+   theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+       text = element_text(size=tsi),
+         axis.ticks = element_line(colour = "black", size = asi),
+       axis.line = element_line(colour = 'black', size = asi),
+panel.background = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5,size=title_size))+
+  labs(y=paste('Copy Number'), x = type)+
+  facet_grid(~Timepoint, space="free", scales="free") 
+return(q)
+
+  
+  
+}
+
+```
+
+```{r}
+
+p1<-g_all('M',list1)
+p2<-g_all('M',list2)
+p3<-g_all('M',list3)
+p1
+p2
+p3
+
+
+```
+```{r}
+p1<-g_all('IFNA',list1)
+p2<-g_all('IFNA',list2)
+p3<-g_all('IFNA',list3)
+p1
+p2
+p3
+```
+
+```{r}
+p1<-g_all('IFNb',list1)
+p2<-g_all('IFNb',list2)
+p3<-g_all('IFNb',list3)
+p1
+p2
+p3
+```
+
+
+```{r}
+p1<-g_all('IL29',list1)
+p2<-g_all('IL29',list2)
+p3<-g_all('IL29',list3)
+p1
+p2
+p3
+```
+
+```{r}
+p1<-g_all('Il28a',list1)
+p2<-g_all('Il28a',list2)
+p3<-g_all('Il28a',list3)
+p1
+p2
+p3
+```
+
+
+```{r}
+p1<-g_all('MXA',list1)
+p2<-g_all('MXA',list2)
+p3<-g_all('MXA',list3)
+p1
+p2
+p3
+```
+
+
+```{r}
+p1<-g_all('RIGI',list1)
+p2<-g_all('RIGI',list2)
+p3<-g_all('RIGI',list3)
+p1
+p2
+p3
+```
+
+
+```{r}
+p1<-g_all('ISG15',list1)
+p2<-g_all('ISG15',list2)
+p3<-g_all('ISG15',list3)
+p1
+p2
+p3
+```
+
+
+```{r}
+p1<-g_all('IFIT2',list1)
+p2<-g_all('IFIT2',list2)
+p3<-g_all('IFIT2',list3)
+p1
+p2
+p3
+```
+
+
+```{r}
+p1<-g_all('IFITM1',list1)
+p2<-g_all('IFITM1',list2)
+p3<-g_all('IFITM1',list3)
+p1
+p2
+p3
+```
+
+```{r}
+p1<-g_all('Rantes',list1)
+p2<-g_all('Rantes',list2)
+p3<-g_all('Rantes',list3)
+p1
+p2
+p3
+```
+
+
+
+```{r}
+dfM.b <-dfM[,1:4]
+dfIFNA.b <-dfIFNA[,1:4]
+dfIFNb.b <-dfIFNb[,1:4]
+dfIL29.b <-dfIL29[,1:4]
+dfIl28a.b <-dfIl28a[,1:4]
+dfMXA.b <-dfMXA[,1:4]
+dfRIGI.b <-dfRIGI[,1:4]
+dfISG15.b <-dfISG15[,1:4]
+dfIFIT2.b <-dfIFIT2[,1:4]
+dfIFITM1.b <-dfIFITM1[,1:4]
+dfRantes.b <-dfRantes[,1:4]
+
+d_long<-Reduce(function(x, y) merge(x, y, all=TRUE), list(dfM.b, dfIFNA.b, dfIFNb.b,dfIL29.b,dfIl28a.b,dfMXA.b,dfRIGI.b,dfISG15.b,dfIFIT2.b,dfIFITM1.b,dfRantes.b))
+
+H<- d_long[order(d_long$Treatment),] %>% subset(Cell.Type=='Wildtype') %>% select(-Cell.Type,Timepoint,Treatment)
+W<- d_long[order(d_long$Treatment),] %>% subset(Cell.Type=='Wildtype') %>% select(-Cell.Type,-Timepoint,-Treatment)
+A<- d_long[order(d_long$Treatment),] %>% subset(Cell.Type=='IFNAR1-/-') %>% select(-Cell.Type,-Timepoint,-Treatment)
+L<- d_long[order(d_long$Treatment),] %>% subset(Cell.Type=='IFNLR1-/-') %>% select(-Cell.Type,-Timepoint,-Treatment)
+
+W.matrix<-t(data.matrix(W))
+A.matrix<-t(data.matrix(A))
+L.matrix<-t(data.matrix(L))
+colnames(W.matrix)=H$Treatment
+colnames(A.matrix)=H$Treatment
+colnames(L.matrix)=H$Treatment
+W.matrix
+A.matrix
+L.matrix
+
+```
+
+
+```{r}
+cell_fun = function(j, i, x, y, width, height, fill) {
+          if(j==3 | j==5 | j==7 | j==9 |j==11)
+        grid.rect(x = x+width*0.1, y = y, width = width, height = height, gp = gpar( fill = fill,col=NA))
+          
+          else
+        grid.rect(x = x, y = y, width = width, height = height, gp = gpar( fill = fill, col=NA))
+        
+}
+df = data.frame(Treatment =H$Treatment, Time=H$Timepoint)
+ha = HeatmapAnnotation(df = df, gap = unit(c(1, 1), "mm"), col = list(Treatment = c("IFN-/IAV-"="black", "IFN-/IAV+"="gray","IFNB+/IAV-"="red","IFNB+/IAV+"="Orange", "IFNL+/IAV-"="Blue", "IFNL+/IAV+"="Purple"), 
+                                           Time = c("12"="gray","24"= "black")),
+                       show_annotation_name = TRUE)
+```
+
+```{r}
+f1 = colorRamp2(seq(min(W.matrix), max(W.matrix), length = 3), c("#3c17fe", "#EEEEEE", "#b2312c"))
+Heatmap(W.matrix,show_column_dend = FALSE, col = f1,show_column_names=F,show_row_names = T, cluster_col=F, cluster_rows = T, heatmap_legend_param = list(title = ""),top_annotation = ha, rect_gp = gpar(type = "none"), cell_fun=cell_fun, column_title = "Wildtype", column_title_gp = gpar(fontsize = 20, fontface = "bold"))
+```
+
+```{r}
+f2 = colorRamp2(seq(min(A.matrix), max(A.matrix), length = 3), c("#3c17fe", "#EEEEEE", "#b2312c"))
+Heatmap(A.matrix,show_column_dend = FALSE, col = f2,show_column_names=F,show_row_names = T, cluster_col=F, cluster_rows = T, heatmap_legend_param = list(title = ""),top_annotation = ha, rect_gp = gpar(type = "none"), cell_fun=cell_fun,column_title = "IFNAR1-/-", column_title_gp = gpar(fontsize = 20, fontface = "bold"))
+```
+
+```{r}
+f3 = colorRamp2(seq(min(L.matrix), max(L.matrix), length = 3), c("#3c17fe", "#EEEEEE", "#b2312c"))
+Heatmap(L.matrix,show_column_dend = FALSE, col = f1,show_column_names=F,show_row_names = T, cluster_col=F, cluster_rows = T, heatmap_legend_param = list(title = ""),top_annotation = ha, rect_gp = gpar(type = "none"), cell_fun=cell_fun,column_title = "IFNLR1-/-", column_title_gp = gpar(fontsize = 20, fontface = "bold"))
+```
+
+
